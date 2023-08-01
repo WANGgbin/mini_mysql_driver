@@ -1,0 +1,1 @@
+mysql 协议可以参考官方文档：[client/server protocol](https://dev.mysql.com/doc/dev/mysql-server/latest/PAGE_PROTOCOL.html)
