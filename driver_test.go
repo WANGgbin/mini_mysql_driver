@@ -1,11 +1,12 @@
 package mysql
 
 import (
-	"context"
 	"database/sql"
+	"fmt"
 	"github.com/smartystreets/goconvey/convey"
 	"net"
 	"testing"
+	"time"
 )
 
 func TestMysql(t *testing.T) {
@@ -14,10 +15,58 @@ func TestMysql(t *testing.T) {
 		db, err := sql.Open("mini_mysql", dsn)
 		convey.So(err, convey.ShouldBeNil)
 
-		err = db.Ping()
-		convey.So(err, convey.ShouldBeNil)
+		//err = db.Ping()
+		//convey.So(err, convey.ShouldBeNil)
 
-		db.QueryContext(context.Background(), "sql", )
+		//rows, err := db.QueryContext(context.Background(), "select name, gender, secret, token, extra, age, born_time from person" )
+		//convey.So(err, convey.ShouldBeNil)
+
+		type Person struct {
+			Name string
+			Gender string
+			IsAlive bool
+			Secret []byte
+			Token []byte
+			Extra []byte
+			// 可能为 null 的字段一定要设置为指针类型
+			Age *int16
+			BornTime time.Time
+		}
+
+		//defer func() {
+		//	_ = rows.Close()
+		//}()
+		//for rows.Next() {
+		//	var p Person
+		//	err = rows.Scan(&p.Name, &p.Gender, &p.Secret, &p.Token, &p.Secret, &p.Age, &p.BornTime)
+		//	convey.So(err, convey.ShouldBeNil)
+		//	t.Logf("%v, %#X", p.Name, p.Token)
+		//}
+
+		//ret, err := db.ExecContext(context.Background(), "insert into person (name, gender, age, secret, is_alive, born_time) values(?, ?, ?, ?, ?, ?)", "小美", "female", nil, "xxxxxx", true, time.Now())
+		//convey.So(err, convey.ShouldBeNil)
+		//lastInserID, err := ret.LastInsertId()
+		//convey.So(err, convey.ShouldBeNil)
+		//affectedRows, err := ret.RowsAffected()
+		//convey.So(err, convey.ShouldBeNil)
+		//
+		//t.Logf("lastInsertID： %d, affectedRows: %d", lastInserID, affectedRows)
+
+		tx, err := db.Begin()
+		if err != nil {
+			fmt.Printf("tx begin error: %v\n", err)
+			return
+		}
+
+		ret, err := tx.Exec("insert into city(name, countrycode, district, population) values(?, ?, ?, ?)", "Beijing", "CHN", "Beijing", 10000000)
+		if err != nil {
+			tx.Rollback()
+			fmt.Printf("insert error: %v, rollback!", err)
+			return
+		}
+		tx.Commit()
+		id, _ := ret.LastInsertId()
+		fmt.Printf("new id: %d\n", id)
 	})
 }
 

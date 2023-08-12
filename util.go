@@ -25,3 +25,20 @@ func Str2Byte(s string) []byte {
 func Byte2Str(b []byte) string {
 	return *(*string)(unsafe.Pointer(&b))
 }
+
+type Bitmap []byte
+
+// IsSet 调用者保证 pos 是正确的
+func (b *Bitmap) IsSet(pos int) bool {
+	return (*b)[pos>>3] & (1 << (pos & 0x07)) != 0
+}
+
+// Set 调用者保证 pos 是正确的
+func (b *Bitmap) Set(pos int) {
+	(*b)[pos>>3] |= 1 << (pos & 0x07)
+}
+
+// Clear 调用者保证 pos 是正确的
+func (b *Bitmap) Clear(pos int) {
+	(*b)[pos>>3] &= ^(1 << (pos & 0x07))
+}

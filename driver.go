@@ -121,6 +121,7 @@ func (d *dbInfo) validate() error {
 var _ driver.Conn = (*mysqlConn)(nil)
 var _ driver.ConnPrepareContext = (*mysqlConn)(nil)
 var _ driver.Pinger = (*mysqlConn)(nil)
+var _ driver.ConnBeginTx = (*mysqlConn)(nil)
 
 type mysqlConn struct {
 	dbInfo   *dbInfo
@@ -230,7 +231,7 @@ func (m *mysqlConn) sendHandshakeResp(hs *HandshakeV10) error {
 		return fmt.Errorf("newHandShakeResp() error: %v", err)
 	}
 
-	err = m.prw.Write(resp, m.curSeqID)
+	err = m.prw.write(resp, m.curSeqID)
 	if err != nil {
 		return err
 	}
@@ -265,7 +266,7 @@ func (m *mysqlConn) sendAuthSwitchResp(req *AuthSwitchReq) error {
 		return err
 	}
 
-	return m.prw.Write(resp, m.curSeqID)
+	return m.prw.write(resp, m.curSeqID)
 }
 
 func (m *mysqlConn) newAuthSwitchResp(req *AuthSwitchReq) (*AuthSwitchResp, error) {
@@ -293,7 +294,7 @@ func (m *mysqlConn) buildAuthResp(scramble []byte, authMethod string) ([]byte, e
 // Ping 发送 CmdPing 检测服务端是否存活
 func (m *mysqlConn) Ping(ctx context.Context) error {
 	m.curSeqID = 0
-	err := m.prw.Write(&CmdPing{Name: 0x0E}, m.curSeqID)
+	err := m.prw.write(&CmdPing{Name: 0x0E}, m.curSeqID)
 	if err != nil {
 		return err
 	}
@@ -307,6 +308,7 @@ func (m *mysqlConn) Ping(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		default:
 		}
 	}
 	return nil
@@ -321,16 +323,18 @@ func (m *mysqlConn) PrepareContext(ctx context.Context, query string) (driver.St
 	if ctx.Done() != nil {
 		select {
 		case <-ctx.Done():
+			_ = s.Close()
 			return nil, ctx.Err()
+		default:
 		}
 	}
 
-	return s, err
+	return s, nil
 }
 
 func (m *mysqlConn) Prepare(query string) (driver.Stmt, error) {
 	m.curSeqID = 0
-	err := m.prw.Write(&StmtPrepare{Name: 0x16, Query: query}, m.curSeqID)
+	err := m.prw.write(&StmtPrepare{Name: 0x16, Query: query}, m.curSeqID)
 	if err != nil {
 		return nil, fmt.Errorf("prepare error: %v", err)
 	}
@@ -341,7 +345,42 @@ func (m *mysqlConn) Prepare(query string) (driver.Stmt, error) {
 	}
 
 	// 初始化 stmt
-	return nil, nil
+	return m.buildStmt(prepareResp)
+}
+
+// buildStmt 在我们的实现中 CapClientDeprecatedEof 总是设置的，因此在 params 和 cols pkt 之后没有 EOF pkt
+func (m *mysqlConn) buildStmt(resp *StmtPrepareOK) (*stmt, error) {
+	var err error
+	var params, cols []*ColumnDef41
+	if resp.NumParams > 0 && !m.capFlag.IsSet(CapClientOptResultSetMetadata) {
+		params = make([]*ColumnDef41, 0, int(resp.NumParams))
+		for idx := 0; idx < int(resp.NumParams); idx++ {
+			var param ColumnDef41
+			err = m.prw.read(&param)
+			if err != nil {
+				return nil, err
+			}
+			params = append(params, &param)
+		}
+	}
+	if resp.NumCols > 0 && !m.capFlag.IsSet(CapClientOptResultSetMetadata) {
+		cols = make([]*ColumnDef41, 0, int(resp.NumCols))
+		for idx := 0; idx < int(resp.NumCols); idx++ {
+			var col ColumnDef41
+			err = m.prw.read(&col)
+			if err != nil {
+				return nil, err
+			}
+			cols = append(cols, &col)
+		}
+	}
+
+	return &stmt{
+		okResp: resp,
+		Params: params,
+		Cols:   cols,
+		mc:     m,
+	}, nil
 }
 
 func (m *mysqlConn) Close() error {
@@ -354,8 +393,40 @@ func (m *mysqlConn) Close() error {
 	return err
 }
 
+// Begin 仅仅为了实现 driver.Conn。
 func (m *mysqlConn) Begin() (driver.Tx, error) {
 	return nil, nil
 }
 
+func (m *mysqlConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	// 如果不是默认隔离级别，开启事务前，需要先设置隔离级别
+	if err := m.setIsolationLevel(sql.IsolationLevel(opts.Isolation)); err != nil {
+		return nil, err
+	}
+
+	query := "START TRANSACTION"
+	if opts.ReadOnly {
+		query += " READ ONLY"
+	}
+
+	if err := m.prw.execCmdQuery(query); err != nil {
+		return nil, err
+	}
+
+	return &tx{
+		conn: m,
+	}, nil
+}
+
+func (m *mysqlConn) setIsolationLevel(level sql.IsolationLevel) error {
+	if level == sql.LevelDefault {
+		return nil
+	}
+
+	if _, support := SupportedIsolationLevelSet[level]; !support {
+		 return fmt.Errorf("unsupported isolationLevel %s", level.String())
+	}
+
+	return m.prw.execCmdQuery(fmt.Sprintf("SET TRANSACTION ISOLATION LEVEL %s", level.String()))
+}
 

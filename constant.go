@@ -1,5 +1,7 @@
 package mysql
 
+import "database/sql"
+
 const (
 	PacketTypeOK  = 0x00
 	PacketTypeEOF = 0x00
@@ -18,3 +20,44 @@ const (
 	ColFlagNowOnUpdate = 13
 	ColFlagGroup       = 15
 )
+
+const (
+	ColTypeDecimal  byte = iota
+	ColTypeTiny
+	ColTypeShort
+	ColTypeLong
+	ColTypeFloat
+	ColTypeDouble
+	ColTypeNULL
+	ColTypeTimestamp
+	ColTypeLongLong
+	ColTypeInt24
+	ColTypeDate
+	ColTypeTime
+	ColTypeDateTime
+	ColTypeYear
+	ColTypeNewDate
+	ColTypeVarChar
+	ColTypeBit
+)
+
+const (
+	ColTypeJSON byte = iota + 0xf5
+	ColTypeNewDecimal
+	ColTypeEnum
+	ColTypeSet
+	ColTypeTinyBLOB
+	ColTypeMediumBLOB
+	ColTypeLongBLOB
+	ColTypeBLOB
+	ColTypeVarString
+	ColTypeString
+	ColTypeGeometry
+)
+
+var SupportedIsolationLevelSet = map[sql.IsolationLevel]struct{} {
+	sql.LevelReadUncommitted: {},
+	sql.LevelReadCommitted: {},
+	sql.LevelRepeatableRead: {},
+	sql.LevelSerializable: {},
+}

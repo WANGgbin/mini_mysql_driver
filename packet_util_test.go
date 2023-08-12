@@ -1,8 +1,10 @@
 package mysql
 
 import (
+	"fmt"
 	"github.com/smartystreets/goconvey/convey"
 	"testing"
+	"time"
 )
 
 func Test_extractPkt(t *testing.T) {
@@ -73,3 +75,48 @@ func Test_satisfyCap(t *testing.T) {
 	})
 }
 
+func Test_marshalTime(t *testing.T) {
+	for i := 0; i < 10; i++ {
+		fmt.Printf("%s\n", string(marshalTime(time.Now())))
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func Test_extractMysqlDouble(t *testing.T) {
+	data := []byte{0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x24, 0x40}
+	d, err := extractMysqlTypeDouble(&data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log(d)
+}
+
+func Test_extractMysqlFloat(t *testing.T) {
+	data := []byte{0x33, 0x33, 0x23, 0x41}
+	d, err := extractMysqlTypeFloat(&data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Log(d)
+}
+
+func Test_extractMysqlTypeDate(t *testing.T) {
+	convey.Convey("", t, func(){
+		testCases := []struct{
+			data []byte
+			want string
+		}{
+			{
+				data: []byte{0x0b, 0xda, 0x07, 0x0a, 0x11, 0x13, 0x1b, 0x1e, 0x01, 0x00, 0x00, 0x00},
+				want: "2010-10-17T19:27:30.000001+08:00",
+			},
+		}
+
+		for _, testCase := range testCases {
+			t, err := doExtractMysqlTypeDate(&testCase.data)
+			convey.So(err, convey.ShouldBeNil)
+
+			convey.So(t.Format(time.RFC3339Nano), convey.ShouldEqual, testCase.want)
+		}
+	})
+}

@@ -3,11 +3,15 @@ package mysql
 import (
 	"bufio"
 	"bytes"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -47,12 +51,31 @@ type pktReadWriter struct {
 	mrw  *mustReadWriter
 }
 
+// execCmdQuery 执行 cmdQuery 命令
+func (prw *pktReadWriter) execCmdQuery(query string) error {
+	prw.conn.curSeqID = 0
+	err := prw.write(
+		&CmdQuery{
+			Name: 0x03,
+			SQL: query,
+		},
+		prw.conn.curSeqID,
+	)
+	if err != nil {
+		return fmt.Errorf("exec query %s error: %v", query, err)
+	}
+
+	if _, err = prw.readOkPkt(); err != nil {
+		return fmt.Errorf("when exec query %s, got err from server: %v", query, err)
+	}
+	return nil
+}
+
 func (prw *pktReadWriter) read(pkt interface{}) error {
 	pk, err := prw.doRead()
 	if err != nil {
 		return err
 	}
-	prw.conn.curSeqID = pk.seqID + 1
 	return extractPkt(&pk.payload, pkt, &prw.conn.capFlag)
 }
 
@@ -114,7 +137,6 @@ func (prw *pktReadWriter) readAuthResult() (interface{}, error) {
 		return nil, fmt.Errorf("when authenticating, recieve err pkt from server: code: %d, msg: %s", errPkt.ErrCode, errPkt.ErrMsg)
 	}
 
-	prw.conn.curSeqID = rawPkt.seqID + 1
 	return pkt, nil
 }
 
@@ -144,11 +166,183 @@ func (prw *pktReadWriter) readStmtPrepareResp() (*StmtPrepareOK, error) {
 		return nil, fmt.Errorf("when prepareing, recieve err pkt from server: code: %d, msg: %s", errPkt.ErrCode, errPkt.ErrMsg)
 	}
 
-	prw.conn.curSeqID = rawPkt.seqID + 1
 	return pkt.(*StmtPrepareOK), nil
 }
 
-func (prw *pktReadWriter) doRead() (*Packet, error) {
+func (prw *pktReadWriter) readQueryResp() (*BinaryResultSet, error) {
+	colCnt, err := prw.readColumnCount()
+	if err != nil {
+		return nil, err
+	}
+
+	cols := make([]*ColumnDef41, colCnt.ColCount)
+	for idx := 0; idx < int(colCnt.ColCount); idx++ {
+		curCol := new(ColumnDef41)
+		err := prw.read(curCol)
+		if err != nil {
+			return nil, fmt.Errorf("extract columnDef error: %v", err)
+		}
+		cols[idx] = curCol
+	}
+
+	return &BinaryResultSet{
+		cnt:  colCnt,
+		cols: cols,
+	}, nil
+}
+
+func (prw *pktReadWriter) readColumnCount() (*ColumnCount, error) {
+	pk, err := prw.doRead()
+	if err != nil {
+		return nil, err
+	}
+
+	var pkt interface{}
+	switch pk.payload[0] {
+	case 0xFF:
+		pkt = new(ErrPacket)
+	default:
+		pkt = new(ColumnCount)
+	}
+
+	err = extractPkt(&pk.payload, pkt, &prw.conn.capFlag)
+	if err != nil {
+		return nil, fmt.Errorf("extract QueryResp pkt error: %v", err)
+	}
+
+	if pkt, ok := pkt.(*ErrPacket); ok {
+		return nil, fmt.Errorf("when querying stmt, receive err pkt from server: code: %d, msg: %s", pkt.ErrCode, pkt.ErrMsg)
+	}
+
+	return pkt.(*ColumnCount), nil
+}
+
+func (prw *pktReadWriter) readNextRow(ret []driver.Value, cols []*ColumnDef41) error {
+	Assert(len(ret) == len(cols), "len(driver.Value) != len(ColDef)")
+	pk, err := prw.doRead()
+	if err != nil {
+		return err
+	}
+
+	// 如果是 OK_Packet，需要返回 io.EOF
+	if pk.payload[0] == 0xFE {
+		return io.EOF
+	}
+
+	pk.payload = pk.payload[1:]
+	nullBitMapLen := (len(cols) + 7 + 2) >> 3
+	nullBitMapByte, err := extractFixedLengthByte(&pk.payload, nullBitMapLen)
+	if err != nil {
+		return fmt.Errorf("extract null bitmap error: %v", err)
+	}
+	nullBitMap := Bitmap(nullBitMapByte)
+
+	for idx := 0; idx < len(cols); idx++ {
+		if nullBitMap.IsSet(idx + 2) {
+			ret[idx] = nil
+			continue
+		}
+		// 各类型的编码方式可以参考：https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_binary_resultset.html#sect_protocol_binary_resultset_row
+		// 不支持类型，后续补充
+		switch cols[idx].Type {
+		case ColTypeString, ColTypeVarString, ColTypeVarChar, ColTypeBLOB, ColTypeMediumBLOB, ColTypeTinyBLOB, ColTypeLongBLOB:
+			ret[idx], err = extractMysqlTypeString(&pk.payload)
+		case ColTypeDouble:
+			ret[idx], err = extractMysqlTypeDouble(&pk.payload)
+		case ColTypeFloat:
+			ret[idx], err = extractMysqlTypeFloat(&pk.payload)
+		case ColTypeDate:
+			ret[idx], err = extractMysqlTypeDate(&pk.payload)
+		case ColTypeDateTime:
+			ret[idx], err = extractMysqlTypeDatetime(&pk.payload)
+		case ColTypeTimestamp:
+			ret[idx], err = extractMysqlTypeTimestamp(&pk.payload)
+		case ColTypeLongLong:
+			var val uint64
+			val, err = extractMysqlTypeUnsignedLongLong(&pk.payload)
+			colFlag := Bitmap(marshalUint16(cols[idx].Flags))
+			if !colFlag.IsSet(ColFlagUnsigned) {
+				ret[idx] = int64(val)
+			} else {
+				ret[idx] = val
+			}
+		case ColTypeLong:
+			var val uint32
+			val, err = extractMysqlTypeUnsignedLong(&pk.payload)
+			colFlag := Bitmap(marshalUint16(cols[idx].Flags))
+			if !colFlag.IsSet(ColFlagUnsigned) {
+				ret[idx] = int32(val)
+			} else {
+				ret[idx] = val
+			}
+		case ColTypeShort:
+			var val uint16
+			val, err = extractMysqlTypeUnsignedShort(&pk.payload)
+			colFlag := Bitmap(marshalUint16(cols[idx].Flags))
+			if !colFlag.IsSet(ColFlagUnsigned) {
+				ret[idx] = int16(val)
+			} else {
+				ret[idx] = val
+			}
+		case ColTypeTiny:
+			var val uint8
+			val, err = extractMysqlTypeUnsignedTiny(&pk.payload)
+			colFlag := Bitmap(marshalUint16(cols[idx].Flags))
+			if !colFlag.IsSet(ColFlagUnsigned) {
+				ret[idx] = int8(val)
+			} else {
+				ret[idx] = val
+			}
+		default:
+			return fmt.Errorf("unknown col type: %d", cols[idx].Type)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (prw *pktReadWriter) readVarInt() (uint64, error) {
+	var first byte
+	err := prw.mrw.read([]byte{first})
+	if err != nil {
+		return 0, err
+	}
+
+	if first < 0xFC {
+		return uint64(first), nil
+	}
+
+	var length []byte
+	switch first {
+	case 0xFC:
+		length = make([]byte, 2)
+		err = prw.mrw.read(length)
+		if err != nil {
+			return 0, err
+		}
+		return extractInt(&length, 2)
+	case 0xFD:
+		length = make([]byte, 3)
+		err = prw.mrw.read(length)
+		if err != nil {
+			return 0, err
+		}
+		return extractInt(&length, 3)
+	case 0xFE:
+		length = make([]byte, 8)
+		err = prw.mrw.read(length)
+		if err != nil {
+			return 0, err
+		}
+		return extractInt(&length, 8)
+	default:
+		return 0, fmt.Errorf("unknown prefix of var int: %#X", first)
+	}
+}
+
+func (prw *pktReadWriter) doReadWithoutPayload() (*Packet, error) {
 	pk := new(Packet)
 
 	lenRaw := make([]byte, 3)
@@ -175,6 +369,15 @@ func (prw *pktReadWriter) doRead() (*Packet, error) {
 	}
 	pk.seqID = uint8(seqID)
 
+	return pk, nil
+}
+
+func (prw *pktReadWriter) doRead() (*Packet, error) {
+	pk, err := prw.doReadWithoutPayload()
+	if err != nil {
+		return nil, err
+	}
+
 	data := make([]byte, pk.length)
 	err = prw.mrw.read(data)
 	if err != nil {
@@ -182,14 +385,115 @@ func (prw *pktReadWriter) doRead() (*Packet, error) {
 	}
 	pk.payload = data
 
+	// 调整数据包的序号
+	prw.conn.curSeqID = pk.seqID + 1
 	return pk, nil
 }
 
-func (prw *pktReadWriter) Write(pkt interface{}, seqID uint8) error {
+func (prw *pktReadWriter) write(pkt interface{}, seqID uint8) error {
 	buf := bytes.Buffer{}
 	payload := marshalPkt(pkt, &prw.conn.capFlag)
-	buf.Write(marshal(uint64(len(payload)), 3))
-	buf.Write(marshal(uint64(seqID), 1))
+	buf.Write(marshalInt(uint64(len(payload)), 3))
+	buf.Write(marshalInt(uint64(seqID), 1))
+	buf.Write(payload)
+
+	data := buf.Bytes()
+
+	err := prw.mrw.write(data)
+	if err != nil {
+		return fmt.Errorf("send packet error: %v", err)
+	}
+	return nil
+}
+
+//  StmtExecPkt 格式参考：https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_execute.html
+func (prw *pktReadWriter) writeStmtExecPkt(stmtOk *StmtPrepareOK, args []driver.Value) error {
+	buf := bytes.Buffer{}
+	buf.WriteByte(0x17)
+	buf.Write(marshalUint32(stmtOk.StmtID))
+	buf.Write(marshalUint8(0))
+	buf.Write(marshalUint32(1))
+	if stmtOk.NumParams > 0 {
+		nullBitMap := make([]byte, (stmtOk.NumParams+7)>>3)
+		for idx, arg := range args {
+			if arg == nil {
+				nullBitMap[idx>>3] |= 1 << (idx & 0x07)
+			}
+		}
+		buf.Write(nullBitMap)
+		// 并不知道该参数的含义
+		buf.WriteByte(0x01)
+
+		paramTypeData := bytes.Buffer{}
+		paramValData := bytes.Buffer{}
+		for _, arg := range args {
+			td, data, err := marshalDriverValue(arg)
+			if err != nil {
+				return err
+			}
+			paramTypeData.Write(td)
+			paramValData.Write(data)
+		}
+		buf.Write(paramTypeData.Bytes())
+		buf.Write(paramValData.Bytes())
+	}
+
+	prw.conn.curSeqID = 0
+	return prw.writeBytes(buf.Bytes(), prw.conn.curSeqID)
+}
+
+// marshalDriverValue 获取 Driver.Value 的类型、值序列化，
+// 在进入该函数之前，sql 会对用户的入参进行类型校验。
+func marshalDriverValue(value driver.Value) ([]byte, []byte, error) {
+	if value == nil {
+		return []byte{ColTypeNULL, 0x00}, nil, nil
+	}
+	tb := make([]byte, 2)
+	var data []byte
+	switch v := value.(type) {
+	case bool:
+		tb[0] = ColTypeTiny
+		tb[1] = 0x00
+		if v {
+			data = marshalInt8(0x01)
+		} else {
+			data = marshalInt8(0x00)
+		}
+	case uint64:
+		tb[0] = ColTypeLongLong
+		tb[1] = 0x80
+		data = marshalUint64(v)
+	case int64:
+		tb[0] = ColTypeLongLong
+		tb[1] = 0x00
+		data = marshalInt64(v)
+	case float64:
+		tb[0] = ColTypeDouble
+		tb[1] = 0x00
+		data = marshalFloat64(v)
+	case []byte:
+		tb[0] = ColTypeString
+		tb[1] = 0x00
+		data = marshalLengthEncodeString(Byte2Str(v))
+	case string:
+		tb[0] = ColTypeString
+		tb[1] = 0x00
+		data = marshalLengthEncodeString(v)
+	case time.Time:
+		// 时间类型以字符串格式序列化
+		tb[0] = ColTypeString
+		tb[1] = 0x00
+		data = marshalTime(v)
+	default:
+		return tb, nil, errors.New("type of Driver.Value should be one of [u]int64/float64/bool/[]byte/string/time.Time")
+	}
+	return tb, data, nil
+}
+
+func (prw *pktReadWriter) writeBytes(payload []byte, seqID uint8) error {
+	buf := bytes.Buffer{}
+	buf.Write(marshalInt(uint64(len(payload)), 3))
+	buf.Write(marshalInt(uint64(seqID), 1))
 	buf.Write(payload)
 
 	data := buf.Bytes()
@@ -261,22 +565,22 @@ func marshalPkt(pkt interface{}, cf *CapFlag) []byte {
 		switch tagVals[0] {
 		case "1":
 			data := fieldVal.Uint()
-			buf.Write(marshal(data, 1))
+			buf.Write(marshalInt(data, 1))
 		case "2":
 			data := fieldVal.Uint()
-			buf.Write(marshal(data, 2))
+			buf.Write(marshalInt(data, 2))
 		case "3":
 			data := fieldVal.Uint()
-			buf.Write(marshal(data, 3))
+			buf.Write(marshalInt(data, 3))
 		case "4":
 			data := fieldVal.Uint()
-			buf.Write(marshal(data, 4))
+			buf.Write(marshalInt(data, 4))
 		case "6":
 			data := fieldVal.Uint()
-			buf.Write(marshal(data, 6))
+			buf.Write(marshalInt(data, 6))
 		case "8":
 			data := fieldVal.Uint()
-			buf.Write(marshal(data, 8))
+			buf.Write(marshalInt(data, 8))
 		case "varInt":
 			data := fieldVal.Uint()
 			buf.Write(marshalVarInt(data))
@@ -287,8 +591,7 @@ func marshalPkt(pkt interface{}, cf *CapFlag) []byte {
 			buf.WriteByte(0x00)
 		case "lenEncoded":
 			data := fieldVal.String()
-			buf.Write(marshalVarInt(uint64(len(data))))
-			buf.WriteString(data)
+			buf.Write(marshalLengthEncodeString(data))
 		default:
 			panic(fmt.Sprintf("unknown val of mpdt tag: %s", tagVals[0]))
 		}
@@ -470,19 +773,248 @@ func satisfySrvStatus(status *srvStatus, cond string) bool {
 	return false
 }
 
-func marshal(val uint64, length int) []byte {
+func marshalInt8(val int8) []byte {
+	return []byte{byte(val)}
+}
+
+func marshalUint8(val uint8) []byte {
+	return []byte{byte(val)}
+}
+
+func marshalInt16(val int16) []byte {
+	ret := make([]byte, 2)
+	ret[0] = byte(val)
+	ret[1] = byte(val >> 8)
+
+	return ret
+}
+
+func marshalUint16(val uint16) []byte {
+	ret := make([]byte, 2)
+	ret[0] = byte(val)
+	ret[1] = byte(val >> 8)
+
+	return ret
+}
+
+func marshalInt24(val int32) []byte {
+	ret := make([]byte, 3)
+	ret[0] = byte(val)
+	ret[1] = byte(val >> 8)
+	ret[2] = byte(val >> 16)
+
+	return ret
+}
+
+func marshalUint24(val uint32) []byte {
+	ret := make([]byte, 3)
+	ret[0] = byte(val)
+	ret[1] = byte(val >> 8)
+	ret[2] = byte(val >> 16)
+
+	return ret
+}
+
+func marshalInt32(val int32) []byte {
+	ret := make([]byte, 4)
+	ret[0] = byte(val)
+	ret[1] = byte(val >> 8)
+	ret[2] = byte(val >> 16)
+	ret[3] = byte(val >> 24)
+
+	return ret
+}
+
+func marshalUint32(val uint32) []byte {
+	ret := make([]byte, 4)
+	ret[0] = byte(val)
+	ret[1] = byte(val >> 8)
+	ret[2] = byte(val >> 16)
+	ret[3] = byte(val >> 24)
+
+	return ret
+}
+
+func marshalInt64(val int64) []byte {
+	ret := make([]byte, 8)
+	ret[0] = byte(val)
+	ret[1] = byte(val >> 8)
+	ret[2] = byte(val >> 16)
+	ret[3] = byte(val >> 24)
+	ret[4] = byte(val >> 32)
+	ret[5] = byte(val >> 40)
+	ret[6] = byte(val >> 48)
+	ret[7] = byte(val >> 56)
+
+	return ret
+}
+
+func marshalUint64(val uint64) []byte {
+	ret := make([]byte, 8)
+	ret[0] = byte(val)
+	ret[1] = byte(val >> 8)
+	ret[2] = byte(val >> 16)
+	ret[3] = byte(val >> 24)
+	ret[4] = byte(val >> 32)
+	ret[5] = byte(val >> 40)
+	ret[6] = byte(val >> 48)
+	ret[7] = byte(val >> 56)
+
+	return ret
+}
+
+func marshalInt(v uint64, length int) []byte {
 	ret := make([]byte, length)
 
 	for idx := 0; idx < length; idx++ {
-		ret[length-1-idx] = byte(val >> (8 * (length - 1 - idx)))
+		ret[idx] = byte(v >> (8 * idx))
 	}
 
 	return ret
 }
 
+func marshalVarInt(v uint64) []byte {
+	if v < 251 {
+		return marshalInt(v, 1)
+	}
+
+	if v < 2^16 {
+		return append([]byte{0xFC}, marshalInt(v, 2)...)
+	}
+
+	if v < 2^24 {
+		return append([]byte{0xFD}, marshalInt(v, 3)...)
+	}
+
+	return append([]byte{0xFE}, marshalInt(v, 8)...)
+}
+
+func marshalFloat32(f float32) []byte {
+	return marshalUint32(math.Float32bits(f))
+}
+
+func marshalFloat64(f float64) []byte {
+	return marshalUint64(math.Float64bits(f))
+}
+
+func marshalLengthEncodeString(data string) []byte {
+	buf := bytes.Buffer{}
+	buf.Write(marshalVarInt(uint64(len(data))))
+	buf.WriteString(data)
+
+	return buf.Bytes()
+}
+
+// marshalTime 序列化时间类型为 "yyyy-MM-ddThh:mm:ss.999999999" 格式
+func marshalTime(t time.Time) []byte {
+	year, month, day := t.Date()
+	hour, minute, second := t.Clock()
+	nanoSecond := t.Nanosecond()
+
+	buf := bytes.Buffer{}
+	buf.Grow(len("yyyy-MM-ddThh:mm:ss.999999999"))
+	// 时间格式必须要指定 年、月、日
+	buf.WriteString(fmt.Sprintf("%04d-%02d-%02d", year, month, day))
+
+	// 时、分、秒、纳秒，如果都为0，可以不指定，直接返回
+	if hour == 0 && minute == 0 && second == 0 && nanoSecond == 0 {
+		return buf.Bytes()
+	}
+
+	buf.WriteByte('T')
+	buf.WriteString(fmt.Sprintf("%02d:%02d:%02d", hour, minute, second))
+
+	if nanoSecond == 0 {
+		return buf.Bytes()
+	}
+
+	buf.WriteByte('.')
+	buf.WriteString(fmt.Sprintf("%09d", nanoSecond))
+
+	return marshalLengthEncodeString(Byte2Str(buf.Bytes()))
+}
+
 var (
 	ErrLessLength = errors.New("less length")
 )
+
+func extractInt8(dataPtr *[]byte) (int8, error) {
+	ret, err := extractInt(dataPtr, 1)
+	if err != nil {
+		return 0, err
+	}
+	return int8(ret), nil
+}
+
+func extractUint8(dataPtr *[]byte) (uint8, error) {
+	ret, err := extractInt(dataPtr, 1)
+	if err != nil {
+		return 0, err
+	}
+	return uint8(ret), nil
+}
+
+func extractInt16(dataPtr *[]byte) (int16, error) {
+	ret, err := extractInt(dataPtr, 2)
+	if err != nil {
+		return 0, err
+	}
+	return int16(ret), nil
+}
+
+func extractUint16(dataPtr *[]byte) (uint16, error) {
+	ret, err := extractInt(dataPtr, 2)
+	if err != nil {
+		return 0, err
+	}
+	return uint16(ret), nil
+}
+
+func extractInt24(dataPtr *[]byte) (int32, error) {
+	ret, err := extractInt(dataPtr, 3)
+	if err != nil {
+		return 0, err
+	}
+	return int32(ret), nil
+}
+
+func extractUint24(dataPtr *[]byte) (uint32, error) {
+	ret, err := extractInt(dataPtr, 3)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(ret), nil
+}
+func extractInt32(dataPtr *[]byte) (int32, error) {
+	ret, err := extractInt(dataPtr, 4)
+	if err != nil {
+		return 0, err
+	}
+	return int32(ret), nil
+}
+
+func extractUint32(dataPtr *[]byte) (uint32, error) {
+	ret, err := extractInt(dataPtr, 4)
+	if err != nil {
+		return 0, err
+	}
+	return uint32(ret), nil
+}
+func extractInt64(dataPtr *[]byte) (int64, error) {
+	ret, err := extractInt(dataPtr, 8)
+	if err != nil {
+		return 0, err
+	}
+	return int64(ret), nil
+}
+
+func extractUint64(dataPtr *[]byte) (uint64, error) {
+	ret, err := extractInt(dataPtr, 8)
+	if err != nil {
+		return 0, err
+	}
+	return ret, nil
+}
 
 func extractInt(dataPtr *[]byte, length int) (uint64, error) {
 	data := *dataPtr
@@ -497,22 +1029,6 @@ func extractInt(dataPtr *[]byte, length int) (uint64, error) {
 
 	*dataPtr = (*dataPtr)[length:]
 	return ret, nil
-}
-
-func marshalVarInt(v uint64) []byte {
-	if v < 251 {
-		return marshal(v, 1)
-	}
-
-	if v < 2^16 {
-		return append([]byte{0xFC}, marshal(v, 2)...)
-	}
-
-	if v < 2^24 {
-		return append([]byte{0xFD}, marshal(v, 3)...)
-	}
-
-	return append([]byte{0xFE}, marshal(v, 8)...)
 }
 
 func extractVarInt(dataPtr *[]byte) (uint64, error) {
@@ -557,6 +1073,16 @@ func extractFixedLengthString(data *[]byte, length int) (string, error) {
 	return ret, nil
 }
 
+func extractFixedLengthByte(data *[]byte, length int) ([]byte, error) {
+	if len(*data) < length {
+		return nil, ErrLessLength
+	}
+
+	ret := (*data)[:length:length]
+	*data = (*data)[length:]
+	return ret, nil
+}
+
 func extractNullTerminatedString(dataPtr *[]byte) (string, error) {
 	idx := 0
 	data := *dataPtr
@@ -590,9 +1116,28 @@ func extractLengthEncodeString(dataPtr *[]byte) (string, error) {
 		return "", ErrLessLength
 	}
 
-	ret := string((*dataPtr)[:length])
+	ret := Byte2Str((*dataPtr)[:length])
 	*dataPtr = (*dataPtr)[length:]
 	return ret, nil
+}
+
+func extractLengthEncodeByte(dataPtr *[]byte) ([]byte, error) {
+	if len(*dataPtr) == 0 {
+		return nil, nil
+	}
+	length, err := extractVarInt(dataPtr)
+	if err != nil {
+		return nil, err
+	}
+
+	if uint64(len(*dataPtr)) < length {
+		return nil, ErrLessLength
+	}
+
+	ret := (*dataPtr)[:length:length]
+	*dataPtr = (*dataPtr)[length:]
+	return ret, nil
+
 }
 
 func extractRestOfPacketString(dataPtr *[]byte) (string, error) {
@@ -605,18 +1150,141 @@ func extractRestOfPacketString(dataPtr *[]byte) (string, error) {
 	return string(ret), nil
 }
 
+/*
+
+********** MARSHAL/EXTRACT MYSQL TYPE **********
+关于 mysql 各个类型序列化方式可以参考：https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_binary_resultset.html#sect_protocol_binary_resultset_row
+
+*/
+
+func extractMysqlTypeString(dataPtr *[]byte) (string, error) {
+	return extractLengthEncodeString(dataPtr)
+}
+
+func extractMysqlTypeUnsignedLongLong(dataPtr *[]byte) (uint64, error) {
+	return extractUint64(dataPtr)
+}
+
+func extractMysqlTypeUnsignedLong(dataPtr *[]byte) (uint32, error) {
+	return extractUint32(dataPtr)
+}
+
+func extractMysqlTypeUnsignedInt24(dataPtr *[]byte) (uint32, error) {
+	return extractUint24(dataPtr)
+}
+
+func extractMysqlTypeUnsignedShort(dataPtr *[]byte) (uint16, error) {
+	return extractUint16(dataPtr)
+}
+
+func extractMysqlTypeUnsignedTiny(dataPtr *[]byte) (uint8, error) {
+	return extractUint8(dataPtr)
+}
+
+func extractMysqlTypeDouble(dataPtr *[]byte) (float64, error) {
+	ret, err := extractInt(dataPtr, 8)
+	if err != nil {
+		return 0, err
+	}
+
+	return math.Float64frombits(ret), nil
+}
+
+func extractMysqlTypeFloat(dataPtr *[]byte) (float32, error) {
+	ret, err := extractInt(dataPtr, 4)
+	if err != nil {
+		return 0, err
+	}
+
+	return math.Float32frombits(uint32(ret)), nil
+}
+
+func extractMysqlTypeDate(dataPtr *[]byte) (time.Time, error) {
+	return doExtractMysqlTypeDate(dataPtr)
+}
+
+func extractMysqlTypeDatetime(dataPtr *[]byte) (time.Time, error) {
+	return doExtractMysqlTypeDate(dataPtr)
+}
+
+func extractMysqlTypeTimestamp(dataPtr *[]byte) (time.Time, error) {
+	return doExtractMysqlTypeDate(dataPtr)
+}
+
+func doExtractMysqlTypeDate(dataPtr *[]byte) (time.Time, error) {
+	length, err := extractUint8(dataPtr)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	if length == 0 {
+		return time.Time{}, nil
+	}
+
+	year, err := extractUint16(dataPtr)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	month, err := extractUint8(dataPtr)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	day, err := extractUint8(dataPtr)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	if length == 4 {
+		// TODO: 握手阶段，需要指定会话时区信息 parseTime=true&loc=Local
+		t := time.Date(int(year), time.Month(month), int(day), 0, 0, 0, 0, time.Local)
+		return t, nil
+	}
+
+	hour, err := extractUint8(dataPtr)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	minute, err := extractUint8(dataPtr)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	second, err := extractUint8(dataPtr)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	if length == 7 {
+		t := time.Date(int(year), time.Month(month), int(day), int(hour), int(minute), int(second), 0, time.Local)
+		return t, nil
+	}
+
+	microSecond, err := extractUint32(dataPtr)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	t := time.Date(int(year), time.Month(month), int(day), int(hour), int(minute), int(second), int(microSecond*1000), time.Local)
+	return t, nil
+}
+
 // 参考：https://dev.mysql.com/doc/dev/mysql-server/latest/group__group__cs__capabilities__flags.html
 const (
-	CapClientLongPassword     = 0
-	CapClientColumnLongFlag   = 2
-	CapClientProtocol41       = 9
-	CapClientConnectWithDB    = 3
-	CapClientPluginAuth       = 19
-	CapClientTransactions     = 13
-	CapClientSessionTrack     = 23
-	CapClientMultiResults     = 16
-	CapClientDeprecateEof     = 24
-	CapClientAuthentication41 = 15
+	CapClientLongPassword         = 0
+	CapClientColumnLongFlag       = 2
+	CapClientProtocol41           = 9
+	CapClientConnectWithDB        = 3
+	CapClientPluginAuth           = 19
+	CapClientTransactions         = 13
+	CapClientSessionTrack         = 23
+	CapClientMultiResults         = 16
+	CapClientDeprecateEof         = 24
+	CapClientAuthentication41     = 15
+	CapClientOptResultSetMetadata = 25
+	CapClientOptQueryAttributes   = 27
 )
 
 var name2CapFlag = map[string]int{

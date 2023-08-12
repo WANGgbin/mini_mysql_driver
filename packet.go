@@ -118,10 +118,40 @@ type ColumnDef41 struct {
 	ColMaxLen uint32 `mpdt:"4"`
 
 	// https://dev.mysql.com/doc/dev/mysql-server/latest/field__types_8h.html#a69e798807026a0f7e12b1d6c72374854
-	Type uint16 `mpdt:"2"`
+	Type uint8 `mpdt:"1"`
 
 	// https://dev.mysql.com/doc/dev/mysql-server/latest/group__group__cs__column__definition__flags.html
 	Flags uint16 `mpdt:"2"`
 
 	Decimals uint8 `mpdt:"1"`
+}
+
+type StmtExec struct {
+}
+
+type ColumnCount struct {
+	ColCount uint64 `mpdt:"varInt"`
+}
+
+type BinaryResultSet struct {
+	cnt  *ColumnCount
+	cols []*ColumnDef41
+}
+
+type StmtClose struct {
+	// 固定值 0x19
+	Status uint8  `mpdt:"1"`
+	StmtID uint32 `mpdt:"4"`
+}
+
+/*
+********** TEXT PROTOCOL **********
+ */
+
+// CmdQuery 当 sql 没有参数的时候，就可以考虑直接使用 CmdQuery 命令，这会减少 prepare/close statement 这样的 roundtrip
+// 从而提高性能
+type CmdQuery struct {
+	// 固定值 0x03
+	Name uint8  `mpdt:"1"`
+	SQL  string `mpdt:"rest"`
 }
