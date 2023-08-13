@@ -64,6 +64,7 @@ func TestMysql(t *testing.T) {
 			fmt.Printf("insert error: %v, rollback!", err)
 			return
 		}
+		_, _ = tx.Exec("desc person")
 		tx.Commit()
 		id, _ := ret.LastInsertId()
 		fmt.Printf("new id: %d\n", id)

@@ -19,9 +19,19 @@ type stmt struct {
 	Params []*ColumnDef41
 
 	mc *mysqlConn
+	closed bool
 }
 
 func (s *stmt) Close() error {
+	// 在关闭 rows 的时候，可能直接关闭连接。sql 包在关闭 rows 之后，还会关闭 stmt，因此这里加一层判断
+	// 如果 mc 已经关闭，直接返回
+	if s.mc.isClosed() {
+		return nil
+	}
+	if s.closed {
+		return nil
+	}
+	s.closed = true
 	scPkt := &StmtClose{
 		Status: 0x19,
 		StmtID: s.okResp.StmtID,
@@ -29,7 +39,8 @@ func (s *stmt) Close() error {
 	s.mc.curSeqID = 0
 	err := s.mc.prw.write(scPkt, s.mc.curSeqID)
 	if err != nil {
-		return fmt.Errorf("close prepare statement error: %v", err)
+		_ = s.mc.Close()
+		return err
 	}
 	return nil
 }
@@ -42,6 +53,7 @@ func (s *stmt) NumInput() int {
 func (s *stmt) QueryContext(ctx context.Context, nvargs []driver.NamedValue) (driver.Rows, error) {
 	args, err := namedValuesToValues(nvargs)
 	if err != nil {
+		_ = s.Close()
 		return nil, err
 	}
 
@@ -56,28 +68,15 @@ func (s *stmt) QueryContext(ctx context.Context, nvargs []driver.NamedValue) (dr
 	return s.Query(args)
 }
 
-func namedValuesToValues(nvargs []driver.NamedValue) ([]driver.Value, error) {
-	args := make([]driver.Value, len(nvargs))
-
-	for idx, nvarg := range nvargs {
-		if nvarg.Name != "" {
-			return nil, errors.New("sql: driver doesn't support the use of Named Parameters")
-		}
-		args[idx] = nvarg.Value
-	}
-
-	return args, nil
-}
-
 func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 	err := s.mc.prw.writeStmtExecPkt(s.okResp, args)
 	if err != nil {
-		return nil, driver.ErrBadConn
+		return nil, s.handleWriteError(err)
 	}
 
 	result, err := s.mc.prw.readQueryResp()
 	if err != nil {
-		return nil, err
+		return nil, s.handleReadError(err)
 	}
 
 	return &rows{
@@ -90,6 +89,7 @@ func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 func (s *stmt) ExecContext(ctx context.Context, nvargs []driver.NamedValue) (driver.Result, error) {
 	args, err := namedValuesToValues(nvargs)
 	if err != nil {
+		_ = s.Close()
 		return nil, err
 	}
 
@@ -107,12 +107,12 @@ func (s *stmt) ExecContext(ctx context.Context, nvargs []driver.NamedValue) (dri
 func (s *stmt) Exec(args []driver.Value) (driver.Result, error) {
 	err := s.mc.prw.writeStmtExecPkt(s.okResp, args)
 	if err != nil {
-		return nil, fmt.Errorf("stmt.Exec write exec pkt error: %v", err)
+		return nil, s.handleWriteError(err)
 	}
 
-	okPkt, err := s.mc.prw.readOkPkt()
+	okPkt, err := s.mc.prw.readOkPkt("StmtExec")
 	if err != nil {
-		return nil, fmt.Errorf("stmt.Exec read ok Pkt error: %v", err)
+		return nil, s.handleReadError(err)
 	}
 
 	return &result{
@@ -162,4 +162,55 @@ func convert(src interface{}) (interface{}, error) {
 		}
 	}
 	return ret, nil
+}
+
+func namedValuesToValues(nvargs []driver.NamedValue) ([]driver.Value, error) {
+	args := make([]driver.Value, len(nvargs))
+
+	for idx, nvarg := range nvargs {
+		if nvarg.Name != "" {
+			return nil, errors.New("sql: driver doesn't support the use of Named Parameters")
+		}
+		args[idx] = nvarg.Value
+	}
+
+	return args, nil
+}
+
+// handleWriteError 是否需要重试
+// tcp 连接可能是从连接池中拿到的旧连接，很有可能该链接已经关闭，因此我们需要区分这种类型的错误(writeZeroBytes)，
+// 并在这种错误发生的时候，通过返回 driver.ErrBadConn 的方式通过 sql 包进行重试。
+// 需要注意的是 driver.ErrBadConn 只在非 tx 中生效
+func (s *stmt) handleWriteError(err error) error {
+	writeErr, ok := err.(*ErrorReadWritePkt)
+	if !ok {
+		_ = s.mc.Close()
+		return err
+	}
+
+	if writeErr.errType == WriteErrTypeMarshalError {
+		_ = s.Close()
+		return err
+	}
+
+	_ = s.mc.Close()
+
+	if writeErr.errType == WriteErrTypeWriteZeroBytes {
+		// 通知 sql 包进行重试
+		return driver.ErrBadConn
+	}
+	return err
+}
+
+// handleReadError 是否可重用连接
+func (s *stmt) handleReadError(err error) error {
+	if readErr, ok := err.(*ErrorReadWritePkt); ok {
+		if readErr.errType == ReadErrTypeErrPkt {
+			_ = s.Close()
+			return err
+		}
+	}
+
+	_ = s.mc.Close()
+	return err
 }

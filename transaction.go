@@ -9,9 +9,23 @@ type tx struct {
 }
 
 func (t *tx) Commit() error {
-	return t.conn.prw.execCmdQuery("COMMIT")
+	if t.conn.isClosed() {
+		return ErrConnHasBeenClosed
+	}
+	err := t.conn.prw.execCmdQuery("COMMIT")
+	if err != nil {
+		_ = t.conn.Close()
+	}
+	return err
 }
 
 func (t *tx) Rollback() error {
-	return t.conn.prw.execCmdQuery("ROLLBACK")
+	if t.conn.isClosed() {
+		return ErrConnHasBeenClosed
+	}
+	err := t.conn.prw.execCmdQuery("ROLLBACK")
+	if err != nil {
+		_ = t.conn.Close()
+	}
+	return err
 }

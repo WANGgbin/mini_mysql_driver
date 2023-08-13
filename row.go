@@ -13,6 +13,7 @@ type rows struct {
 	mc     *mysqlConn
 
 	closed bool
+	err error
 }
 
 func (r *rows) Columns() []string {
@@ -30,6 +31,10 @@ func (r *rows) Close() error {
 	if r.closed {
 		return nil
 	}
+	// Next() 发生非 io.EOF 错误，直接关闭连接
+	if r.err != nil {
+		return r.mc.Close()
+	}
 	// 读取剩下数据
 	discard := make([]driver.Value, len(r.stmt.Cols))
 	for {
@@ -38,7 +43,7 @@ func (r *rows) Close() error {
 			break
 		}
 		if err != nil {
-			return err
+			return r.mc.Close()
 		}
 	}
 	return r.close()
@@ -55,7 +60,7 @@ func (r *rows) Next(dest []driver.Value) error {
 	if err == io.EOF {
 		_ = r.close()
 	}
-
+	r.err = err
 	return err
 }
 

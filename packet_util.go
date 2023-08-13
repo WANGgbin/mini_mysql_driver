@@ -57,30 +57,36 @@ func (prw *pktReadWriter) execCmdQuery(query string) error {
 	err := prw.write(
 		&CmdQuery{
 			Name: 0x03,
-			SQL: query,
+			SQL:  query,
 		},
 		prw.conn.curSeqID,
 	)
 	if err != nil {
-		return fmt.Errorf("exec query %s error: %v", query, err)
+		return err
 	}
 
-	if _, err = prw.readOkPkt(); err != nil {
+	if _, err = prw.readOkPkt(fmt.Sprintf("CmdQuery: %s", query)); err != nil {
 		return fmt.Errorf("when exec query %s, got err from server: %v", query, err)
 	}
 	return nil
 }
 
 func (prw *pktReadWriter) read(pkt interface{}) error {
-	pk, err := prw.doRead()
+	Assert(reflect.TypeOf(pkt).Kind() == reflect.Ptr && reflect.TypeOf(pkt).Elem().Kind() == reflect.Struct, "pkt must be pointer to struct")
+	pk, err := prw.doRead(reflect.TypeOf(pkt).Elem().Name())
 	if err != nil {
 		return err
 	}
-	return extractPkt(&pk.payload, pkt, &prw.conn.capFlag)
+	err = extractPkt(&pk.payload, pkt, &prw.conn.capFlag)
+	if err != nil {
+		return &ErrorReadWritePkt{event: fmt.Sprintf("read pkt %s", reflect.TypeOf(pkt).Elem().Name()), errType: ReadErrTypeMalformedPkt, raw: err}
+	}
+
+	return nil
 }
 
-func (prw *pktReadWriter) readOkPkt() (*OkPacket, error) {
-	rawPkt, err := prw.doRead()
+func (prw *pktReadWriter) readOkPkt(pktName string) (*OkPacket, error) {
+	rawPkt, err := prw.doRead(pktName)
 	if err != nil {
 		return nil, err
 	}
@@ -92,16 +98,16 @@ func (prw *pktReadWriter) readOkPkt() (*OkPacket, error) {
 	case 0xFF:
 		pkt = new(ErrPacket)
 	default:
-		return nil, fmt.Errorf("receive unknown packet stating with [%#X]", rawPkt.payload[0])
+		return nil, &ErrorReadWritePkt{event: pktName, errType: ReadErrTypeUnknownPkt, raw: fmt.Errorf("staring with [%#X]", rawPkt.payload[0])}
 	}
 
 	err = extractPkt(&rawPkt.payload, pkt, &prw.conn.capFlag)
 	if err != nil {
-		return nil, fmt.Errorf("extrack pkt error: %v", err)
+		return nil, &ErrorReadWritePkt{event: pktName, errType: ReadErrTypeMalformedPkt, raw: err}
 	}
 
 	if errPkt, ok := pkt.(*ErrPacket); ok {
-		return nil, fmt.Errorf("recieve err pkt from server: code: %d, msg: %s", errPkt.ErrCode, errPkt.ErrMsg)
+		return nil, &ErrorReadWritePkt{event: pktName, errType: ReadErrTypeErrPkt, raw: fmt.Errorf("code: %d, msg: %s", errPkt.ErrCode, errPkt.ErrMsg)}
 	}
 
 	prw.conn.curSeqID = 0
@@ -109,7 +115,7 @@ func (prw *pktReadWriter) readOkPkt() (*OkPacket, error) {
 }
 
 func (prw *pktReadWriter) readAuthResult() (interface{}, error) {
-	rawPkt, err := prw.doRead()
+	rawPkt, err := prw.doRead("AuthResult")
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +147,7 @@ func (prw *pktReadWriter) readAuthResult() (interface{}, error) {
 }
 
 func (prw *pktReadWriter) readStmtPrepareResp() (*StmtPrepareOK, error) {
-	rawPkt, err := prw.doRead()
+	rawPkt, err := prw.doRead("StmtPrepareResp")
 	if err != nil {
 		return nil, err
 	}
@@ -154,16 +160,16 @@ func (prw *pktReadWriter) readStmtPrepareResp() (*StmtPrepareOK, error) {
 	case 0xFF:
 		pkt = new(ErrPacket)
 	default:
-		return nil, fmt.Errorf("receive unknown packet stating with [%#X] after sending prepare", rawPkt.payload[0])
+		return nil, &ErrorReadWritePkt{event: "read StmtPrepareResp", errType: ReadErrTypeUnknownPkt, raw: fmt.Errorf("stating with [%#X]", rawPkt.payload[0])}
 	}
 
 	err = extractPkt(&rawPkt.payload, pkt, &prw.conn.capFlag)
 	if err != nil {
-		return nil, fmt.Errorf("extrack prepare resp pkt error: %v", err)
+		return nil, &ErrorReadWritePkt{event: "read StmtPrepareResp", errType: ReadErrTypeMalformedPkt, raw: err}
 	}
 
 	if errPkt, ok := pkt.(*ErrPacket); ok {
-		return nil, fmt.Errorf("when prepareing, recieve err pkt from server: code: %d, msg: %s", errPkt.ErrCode, errPkt.ErrMsg)
+		return nil, &ErrorReadWritePkt{event: "read StmtPrepareResp", errType: ReadErrTypeErrPkt, raw: fmt.Errorf("code: %d, msg: %s", errPkt.ErrCode, errPkt.ErrMsg)}
 	}
 
 	return pkt.(*StmtPrepareOK), nil
@@ -178,9 +184,9 @@ func (prw *pktReadWriter) readQueryResp() (*BinaryResultSet, error) {
 	cols := make([]*ColumnDef41, colCnt.ColCount)
 	for idx := 0; idx < int(colCnt.ColCount); idx++ {
 		curCol := new(ColumnDef41)
-		err := prw.read(curCol)
+		err = prw.read(curCol)
 		if err != nil {
-			return nil, fmt.Errorf("extract columnDef error: %v", err)
+			return nil, err
 		}
 		cols[idx] = curCol
 	}
@@ -192,7 +198,7 @@ func (prw *pktReadWriter) readQueryResp() (*BinaryResultSet, error) {
 }
 
 func (prw *pktReadWriter) readColumnCount() (*ColumnCount, error) {
-	pk, err := prw.doRead()
+	pk, err := prw.doRead("ColumnCount")
 	if err != nil {
 		return nil, err
 	}
@@ -207,11 +213,11 @@ func (prw *pktReadWriter) readColumnCount() (*ColumnCount, error) {
 
 	err = extractPkt(&pk.payload, pkt, &prw.conn.capFlag)
 	if err != nil {
-		return nil, fmt.Errorf("extract QueryResp pkt error: %v", err)
+		return nil, &ErrorReadWritePkt{event: "read ColumnCount", errType: ReadErrTypeMalformedPkt, raw: err}
 	}
 
 	if pkt, ok := pkt.(*ErrPacket); ok {
-		return nil, fmt.Errorf("when querying stmt, receive err pkt from server: code: %d, msg: %s", pkt.ErrCode, pkt.ErrMsg)
+		return nil, &ErrorReadWritePkt{event: "read ColumnCount", errType: ReadErrTypeErrPkt, raw: fmt.Errorf("code: %d, msg: %s", pkt.ErrCode, pkt.ErrMsg)}
 	}
 
 	return pkt.(*ColumnCount), nil
@@ -219,7 +225,7 @@ func (prw *pktReadWriter) readColumnCount() (*ColumnCount, error) {
 
 func (prw *pktReadWriter) readNextRow(ret []driver.Value, cols []*ColumnDef41) error {
 	Assert(len(ret) == len(cols), "len(driver.Value) != len(ColDef)")
-	pk, err := prw.doRead()
+	pk, err := prw.doRead("Row")
 	if err != nil {
 		return err
 	}
@@ -342,52 +348,43 @@ func (prw *pktReadWriter) readVarInt() (uint64, error) {
 	}
 }
 
-func (prw *pktReadWriter) doReadWithoutPayload() (*Packet, error) {
-	pk := new(Packet)
+func (prw *pktReadWriter) doRead(pktName string) (pkt *Packet, err error) {
+	pkt = new(Packet)
 
 	lenRaw := make([]byte, 3)
-	err := prw.mrw.read(lenRaw)
+	err = prw.mrw.read(lenRaw)
 	if err != nil {
-		return nil, err
+		return nil, &ErrorReadWritePkt{event: fmt.Sprintf("read length of pkt %s", pktName), errType: ReadErrTypeSocket, raw: err}
 	}
 
 	length, err := extractInt(&lenRaw, 3)
 	if err != nil {
-		return nil, err
+		return nil, &ErrorReadWritePkt{event: fmt.Sprintf("read length of pkt: %s", pktName), errType: ReadErrTypeMalformedPkt, raw: err}
 	}
-	pk.length = uint32(length)
+	pkt.length = uint32(length)
 
 	seqIDRaw := make([]byte, 1)
 	err = prw.mrw.read(seqIDRaw)
 	if err != nil {
-		return nil, err
+		return nil, &ErrorReadWritePkt{event: fmt.Sprintf("read seqID of pkt: %s", pktName), errType: ReadErrTypeSocket, raw: err}
 	}
 
 	seqID, err := extractInt(&seqIDRaw, 1)
 	if err != nil {
-		return nil, err
+		return nil, &ErrorReadWritePkt{event: fmt.Sprintf("read seqID of pkt: %s", pktName), errType: ReadErrTypeMalformedPkt, raw: err}
 	}
-	pk.seqID = uint8(seqID)
+	pkt.seqID = uint8(seqID)
 
-	return pk, nil
-}
-
-func (prw *pktReadWriter) doRead() (*Packet, error) {
-	pk, err := prw.doReadWithoutPayload()
-	if err != nil {
-		return nil, err
-	}
-
-	data := make([]byte, pk.length)
+	data := make([]byte, pkt.length)
 	err = prw.mrw.read(data)
 	if err != nil {
-		return nil, err
+		return nil, &ErrorReadWritePkt{event: fmt.Sprintf("read payload of pkt: %s", pktName), errType: ReadErrTypeSocket, raw: err}
 	}
-	pk.payload = data
+	pkt.payload = data
 
 	// 调整数据包的序号
-	prw.conn.curSeqID = pk.seqID + 1
-	return pk, nil
+	prw.conn.curSeqID = pkt.seqID + 1
+	return pkt, nil
 }
 
 func (prw *pktReadWriter) write(pkt interface{}, seqID uint8) error {
@@ -401,7 +398,8 @@ func (prw *pktReadWriter) write(pkt interface{}, seqID uint8) error {
 
 	err := prw.mrw.write(data)
 	if err != nil {
-		return fmt.Errorf("send packet error: %v", err)
+		err.event = fmt.Sprintf("write pkt: %s", reflect.TypeOf(pkt).Elem().Name())
+		return err
 	}
 	return nil
 }
@@ -429,7 +427,7 @@ func (prw *pktReadWriter) writeStmtExecPkt(stmtOk *StmtPrepareOK, args []driver.
 		for _, arg := range args {
 			td, data, err := marshalDriverValue(arg)
 			if err != nil {
-				return err
+				return &ErrorReadWritePkt{event: "write StmtExec", errType: WriteErrTypeMarshalError, raw: err}
 			}
 			paramTypeData.Write(td)
 			paramValData.Write(data)
@@ -500,7 +498,7 @@ func (prw *pktReadWriter) writeBytes(payload []byte, seqID uint8) error {
 
 	err := prw.mrw.write(data)
 	if err != nil {
-		return fmt.Errorf("send packet error: %v", err)
+		return err
 	}
 	return nil
 }
@@ -522,18 +520,19 @@ func (m *mustReadWriter) read(p []byte) error {
 	return nil
 }
 
-func (m *mustReadWriter) write(p []byte) error {
+func (m *mustReadWriter) write(p []byte) *ErrorReadWritePkt {
+	Assert(len(p) > 0, "length of data to write must be greater than 0")
 	n, err := m.brw.Write(p)
 	if err != nil {
-		return fmt.Errorf("write error: %v", err)
-	}
-	if len(p) != n {
-		return fmt.Errorf("write %d bytes, expected: %d bytes", n, len(p))
+		if n == 0 {
+			return &ErrorReadWritePkt{event: "write data", errType: WriteErrTypeWriteZeroBytes, raw: err}
+		}
+		return &ErrorReadWritePkt{event: "write data", errType: WriteErrTypeWriteSocket, raw: err}
 	}
 
 	err = m.brw.Flush()
 	if err != nil {
-		return fmt.Errorf("flush buf error: %v", err)
+		return &ErrorReadWritePkt{event: "flush data", errType: WriteErrTypeWriteSocket, raw: err}
 	}
 
 	return nil

@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"github.com/sirupsen/logrus"
 	"net"
 	"reflect"
 	"strconv"
@@ -122,6 +123,7 @@ var _ driver.Conn = (*mysqlConn)(nil)
 var _ driver.ConnPrepareContext = (*mysqlConn)(nil)
 var _ driver.Pinger = (*mysqlConn)(nil)
 var _ driver.ConnBeginTx = (*mysqlConn)(nil)
+var _ driver.Validator = (*mysqlConn)(nil)
 
 type mysqlConn struct {
 	dbInfo   *dbInfo
@@ -134,6 +136,8 @@ type mysqlConn struct {
 
 var defaultTimeOut = 1 * time.Second
 
+// newMysqlConn 是否有必要池化 mysqlConn 对象
+// 发生任何错误都应该返回 driver.ErrBadConn 这样 sql 包会进行重试
 func newMysqlConn(db *dbInfo) (*mysqlConn, error) {
 	dialer := &net.Dialer{
 		// TODO(@wangguobin): 用户可配置建立连接超时时间
@@ -142,7 +146,8 @@ func newMysqlConn(db *dbInfo) (*mysqlConn, error) {
 	}
 	conn, err := dialer.Dial(db.protocol, fmt.Sprintf("%s:%d", db.ip, db.port))
 	if err != nil {
-		return nil, err
+		logrus.Errorf("when creating new conn, err happened: %v", err)
+		return nil, driver.ErrBadConn
 	}
 
 	mc := &mysqlConn{
@@ -155,7 +160,8 @@ func newMysqlConn(db *dbInfo) (*mysqlConn, error) {
 	err = mc.login()
 	if err != nil {
 		_ = mc.Close()
-		return nil, err
+		logrus.Errorf("when login, err happened: %v", err)
+		return nil, driver.ErrBadConn
 	}
 
 	return mc, nil
@@ -296,10 +302,11 @@ func (m *mysqlConn) Ping(ctx context.Context) error {
 	m.curSeqID = 0
 	err := m.prw.write(&CmdPing{Name: 0x0E}, m.curSeqID)
 	if err != nil {
-		return err
+		return m.handleWriteError(err)
 	}
 
-	if _, err = m.prw.readOkPkt(); err != nil {
+	if _, err = m.prw.readOkPkt("Ping"); err != nil {
+		_ = m.Close()
 		return err
 	}
 
@@ -336,12 +343,12 @@ func (m *mysqlConn) Prepare(query string) (driver.Stmt, error) {
 	m.curSeqID = 0
 	err := m.prw.write(&StmtPrepare{Name: 0x16, Query: query}, m.curSeqID)
 	if err != nil {
-		return nil, fmt.Errorf("prepare error: %v", err)
+		return nil, m.handleWriteError(err)
 	}
 
 	prepareResp, err := m.prw.readStmtPrepareResp()
 	if err != nil {
-		return nil, fmt.Errorf("prepare resp error: %v", err)
+		return nil, m.handleReadError(err)
 	}
 
 	// 初始化 stmt
@@ -351,6 +358,11 @@ func (m *mysqlConn) Prepare(query string) (driver.Stmt, error) {
 // buildStmt 在我们的实现中 CapClientDeprecatedEof 总是设置的，因此在 params 和 cols pkt 之后没有 EOF pkt
 func (m *mysqlConn) buildStmt(resp *StmtPrepareOK) (*stmt, error) {
 	var err error
+	defer func() {
+		if err != nil {
+			_ = m.Close()
+		}
+	}()
 	var params, cols []*ColumnDef41
 	if resp.NumParams > 0 && !m.capFlag.IsSet(CapClientOptResultSetMetadata) {
 		params = make([]*ColumnDef41, 0, int(resp.NumParams))
@@ -389,11 +401,15 @@ func (m *mysqlConn) Close() error {
 	}
 
 	m.closed = true
-	err := m.conn.Close()
-	return err
+	return m.conn.Close()
+}
+
+func (m *mysqlConn) isClosed() bool {
+	return m.closed
 }
 
 // Begin 仅仅为了实现 driver.Conn。
+// Deprecated
 func (m *mysqlConn) Begin() (driver.Tx, error) {
 	return nil, nil
 }
@@ -401,7 +417,7 @@ func (m *mysqlConn) Begin() (driver.Tx, error) {
 func (m *mysqlConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	// 如果不是默认隔离级别，开启事务前，需要先设置隔离级别
 	if err := m.setIsolationLevel(sql.IsolationLevel(opts.Isolation)); err != nil {
-		return nil, err
+		return nil, m.handleWriteError(err)
 	}
 
 	query := "START TRANSACTION"
@@ -410,7 +426,8 @@ func (m *mysqlConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.
 	}
 
 	if err := m.prw.execCmdQuery(query); err != nil {
-		return nil, err
+		_ = m.Close()
+		return nil, m.handleWriteError(err)
 	}
 
 	return &tx{
@@ -430,3 +447,27 @@ func (m *mysqlConn) setIsolationLevel(level sql.IsolationLevel) error {
 	return m.prw.execCmdQuery(fmt.Sprintf("SET TRANSACTION ISOLATION LEVEL %s", level.String()))
 }
 
+// IsValid sql 会调用 IsValid 来判断连接是否有效
+func (m *mysqlConn) IsValid() bool {
+	return !m.closed
+}
+
+func (m *mysqlConn) handleReadError(err error) error {
+	// 实际上，即使是 ReadErrTypeErrPkt，某些时候仍然需要关闭连接
+	if readErr, ok := err.(*ErrorReadWritePkt); !ok || readErr.errType != ReadErrTypeErrPkt {
+		_ = m.Close()
+	}
+	return err
+}
+
+// handleWriteError 是否需要重试
+// tcp 连接可能是从连接池中拿到的旧连接，很有可能该链接已经关闭，因此我们需要区分这种类型的错误(writeZeroBytes)，
+// 并在这种错误发生的时候，通过返回 driver.ErrBadConn 的方式通过 sql 包进行重试。
+func (m *mysqlConn) handleWriteError(err error) error {
+	_ = m.Close()
+	if writeErr, ok := err.(*ErrorReadWritePkt); ok && writeErr.errType == WriteErrTypeWriteZeroBytes {
+		return driver.ErrBadConn
+	}
+
+	return err
+}
