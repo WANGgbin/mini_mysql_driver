@@ -61,3 +61,7 @@ var SupportedIsolationLevelSet = map[sql.IsolationLevel]struct{} {
 	sql.LevelRepeatableRead: {},
 	sql.LevelSerializable: {},
 }
+
+var charset2Num = map[string]uint8 {
+	"utf8mb4": 45,
+}

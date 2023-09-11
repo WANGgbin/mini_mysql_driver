@@ -1,10 +1,11 @@
 package mysql
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/smartystreets/goconvey/convey"
-	"net"
 	"testing"
 	"time"
 )
@@ -12,14 +13,14 @@ import (
 func TestMysql(t *testing.T) {
 	convey.Convey("", t, func(){
 		dsn := "test:123456@tcp(127.0.0.1:3306)/world"
-		db, err := sql.Open("mini_mysql", dsn)
+		db, err := sql.Open("mysql", dsn)
 		convey.So(err, convey.ShouldBeNil)
 
-		//err = db.Ping()
-		//convey.So(err, convey.ShouldBeNil)
+		err = db.Ping()
+		convey.So(err, convey.ShouldBeNil)
 
-		//rows, err := db.QueryContext(context.Background(), "select name, gender, secret, token, extra, age, born_time from person" )
-		//convey.So(err, convey.ShouldBeNil)
+		rows, err := db.QueryContext(context.Background(), "select name, gender, secret, token, extra, age, born_time from person where id = 1" )
+		convey.So(err, convey.ShouldBeNil)
 
 		type Person struct {
 			Name string
@@ -33,24 +34,23 @@ func TestMysql(t *testing.T) {
 			BornTime time.Time
 		}
 
-		//defer func() {
-		//	_ = rows.Close()
-		//}()
-		//for rows.Next() {
-		//	var p Person
-		//	err = rows.Scan(&p.Name, &p.Gender, &p.Secret, &p.Token, &p.Secret, &p.Age, &p.BornTime)
-		//	convey.So(err, convey.ShouldBeNil)
-		//	t.Logf("%v, %#X", p.Name, p.Token)
-		//}
+		defer func() {
+			_ = rows.Close()
+		}()
+		for rows.Next() {
+			var p Person
+			err = rows.Scan(&p.Name, &p.Gender, &p.Secret, &p.Token, &p.Secret, &p.Age, &p.BornTime)
+			convey.So(err, convey.ShouldBeNil)
+			t.Logf("%v, %#X, %s", p.Name, p.Token, p.BornTime.Format(time.RFC3339))
+		}
 
-		//ret, err := db.ExecContext(context.Background(), "insert into person (name, gender, age, secret, is_alive, born_time) values(?, ?, ?, ?, ?, ?)", "小美", "female", nil, "xxxxxx", true, time.Now())
-		//convey.So(err, convey.ShouldBeNil)
-		//lastInserID, err := ret.LastInsertId()
-		//convey.So(err, convey.ShouldBeNil)
-		//affectedRows, err := ret.RowsAffected()
-		//convey.So(err, convey.ShouldBeNil)
-		//
-		//t.Logf("lastInsertID： %d, affectedRows: %d", lastInserID, affectedRows)
+		ret, err := db.ExecContext(context.Background(), "insert into person (name, gender, age, secret, is_alive, born_time) values(?, ?, ?, ?, ?, ?)", "小美", "female", nil, []byte{0x01, 0x02}, true, time.Now())
+		convey.So(err, convey.ShouldBeNil)
+		lastInserID, err := ret.LastInsertId()
+		convey.So(err, convey.ShouldBeNil)
+		affectedRows, err := ret.RowsAffected()
+		convey.So(err, convey.ShouldBeNil)
+		t.Logf("lastInsertID： %d, affectedRows: %d", lastInserID, affectedRows)
 
 		tx, err := db.Begin()
 		if err != nil {
@@ -68,45 +68,5 @@ func TestMysql(t *testing.T) {
 		tx.Commit()
 		id, _ := ret.LastInsertId()
 		fmt.Printf("new id: %d\n", id)
-	})
-}
-
-func Test_parseDsn(t *testing.T) {
-	convey.Convey("", t, func(){
-		testCases := []struct {
-			name string
-			dsn string
-			want *dbInfo
-			shouldErr bool
-		}{
-			{
-				name: "miss user",
-				dsn: "1234@tcp(127.0.0.1:3306)/world",
-				shouldErr: true,
-			},
-			{
-				name: "right",
-				dsn: "name:1234@tcp(127.0.0.1:3306)/world",
-				want: &dbInfo{
-					ip: net.IP{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 127, 0, 0, 1},
-					port: 3306,
-					protocol: "tcp",
-					user: "name",
-					password: "1234",
-					dbName: "world",
-				},
-			},
-		}
-
-		for _, testCase := range testCases {
-			convey.Convey(testCase.name, func(){
-				gotDbInfo, gotErr := parseDsn(testCase.dsn)
-				if testCase.shouldErr {
-					convey.So(gotErr, convey.ShouldNotBeNil)
-				} else {
-					convey.So(gotDbInfo, convey.ShouldResemble, testCase.want)
-				}
-			})
-		}
 	})
 }

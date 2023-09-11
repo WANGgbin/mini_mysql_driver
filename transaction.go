@@ -13,6 +13,8 @@ func (t *tx) Commit() error {
 		return ErrConnHasBeenClosed
 	}
 	err := t.conn.prw.execCmdQuery("COMMIT")
+	// 取消 tx 与 conn 关联关系
+	t.conn = nil
 	if err != nil {
 		_ = t.conn.Close()
 	}
@@ -24,6 +26,8 @@ func (t *tx) Rollback() error {
 		return ErrConnHasBeenClosed
 	}
 	err := t.conn.prw.execCmdQuery("ROLLBACK")
+	// 取消 tx 与 conn 关联关系
+	t.conn = nil
 	if err != nil {
 		_ = t.conn.Close()
 	}

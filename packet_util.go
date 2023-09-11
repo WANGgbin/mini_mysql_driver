@@ -223,6 +223,7 @@ func (prw *pktReadWriter) readColumnCount() (*ColumnCount, error) {
 	return pkt.(*ColumnCount), nil
 }
 
+// readNextRow 时间类型，默认转化为 time.Time 类型
 func (prw *pktReadWriter) readNextRow(ret []driver.Value, cols []*ColumnDef41) error {
 	Assert(len(ret) == len(cols), "len(driver.Value) != len(ColDef)")
 	pk, err := prw.doRead("Row")

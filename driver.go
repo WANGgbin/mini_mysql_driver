@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"github.com/sirupsen/logrus"
 	"net"
-	"reflect"
-	"strconv"
 	"time"
 )
 
@@ -22,101 +20,12 @@ var _ driver.Driver = (*mysqlDriver)(nil)
 type mysqlDriver struct{}
 
 func (m *mysqlDriver) Open(dsn string) (driver.Conn, error) {
-	dbInfo, err := parseDsn(dsn)
+	cfg, err := parseDsn(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parseDsn error: %v", err)
 	}
 
-	return newMysqlConn(dbInfo)
-}
-
-type dbInfo struct {
-	ip       net.IP
-	port     uint16
-	protocol string
-	user     string
-	password string
-	dbName   string
-}
-
-// parseDsn 解析 dsn 字符串，dsn 格式："user:password@protocol(ip:port)/dbName?key1=val1&key2=val2"
-func parseDsn(dsn string) (*dbInfo, error) {
-	ret := &dbInfo{}
-	var left, right int
-	for ; right < len(dsn); right++ {
-		switch dsn[right] {
-		case ':':
-			part := dsn[left:right]
-			if ret.user == "" {
-				if part == "" {
-					return nil, errors.New("miss user field")
-				}
-				ret.user = part
-			} else {
-				if part == "" {
-					return nil, errors.New("miss ip field")
-				}
-
-				ret.ip = net.ParseIP(part)
-				if ret.ip == nil {
-					return nil, errors.New("invalid ip address")
-				}
-			}
-			left = right + 1
-		case '@':
-			part := dsn[left:right]
-			if part == "" {
-				return nil, errors.New("miss password field")
-			}
-			ret.password = part
-			left = right + 1
-		case '(':
-			part := dsn[left:right]
-			if part == "" {
-				return nil, errors.New("miss protocol field")
-			}
-			switch part {
-			// 目前仅支持 tcp/unix 协议
-			case "tcp", "unix":
-			default:
-				return nil, fmt.Errorf("unknown protocol: %s. should be one of tcp/unix", part)
-			}
-			ret.protocol = part
-			left = right + 1
-		case ')':
-			part := dsn[left:right]
-			port, err := strconv.ParseUint(part, 10, 16)
-			if err != nil {
-				return nil, fmt.Errorf("%s is not invalid port, should be in [0, 2^16 - 1]", part)
-			}
-			ret.port = uint16(port)
-			left = right + 1
-		case '/':
-			dbName := dsn[right+1:]
-			if len(dbName) == 0 {
-				return nil, errors.New("miss dbName field")
-			}
-			ret.dbName = dbName
-		}
-	}
-
-	err := ret.validate()
-	if err != nil {
-		return nil, err
-	}
-
-	return ret, nil
-}
-
-func (d *dbInfo) validate() error {
-	val := reflect.ValueOf(d).Elem()
-	for idx := 0; idx < val.NumField(); idx++ {
-		field := val.Field(idx)
-		if field.IsZero() {
-			return fmt.Errorf("miss field: %s", val.Type().Field(idx).Name)
-		}
-	}
-	return nil
+	return newMysqlConn(cfg)
 }
 
 var _ driver.Conn = (*mysqlConn)(nil)
@@ -126,7 +35,7 @@ var _ driver.ConnBeginTx = (*mysqlConn)(nil)
 var _ driver.Validator = (*mysqlConn)(nil)
 
 type mysqlConn struct {
-	dbInfo   *dbInfo
+	dbCfg    *dbCfg
 	conn     net.Conn
 	prw      *pktReadWriter
 	capFlag  CapFlag
@@ -138,7 +47,7 @@ var defaultTimeOut = 1 * time.Second
 
 // newMysqlConn 是否有必要池化 mysqlConn 对象
 // 发生任何错误都应该返回 driver.ErrBadConn 这样 sql 包会进行重试
-func newMysqlConn(db *dbInfo) (*mysqlConn, error) {
+func newMysqlConn(db *dbCfg) (*mysqlConn, error) {
 	dialer := &net.Dialer{
 		// TODO(@wangguobin): 用户可配置建立连接超时时间
 		Timeout:   defaultTimeOut,
@@ -151,8 +60,8 @@ func newMysqlConn(db *dbInfo) (*mysqlConn, error) {
 	}
 
 	mc := &mysqlConn{
-		dbInfo: db,
-		conn:   conn,
+		dbCfg: db,
+		conn:  conn,
 	}
 
 	mc.prw = newPktReadWriter(mc)
@@ -215,10 +124,15 @@ func (m *mysqlConn) login() error {
 	}
 
 	if _, ok := pkt.(*OkPacket); ok {
-		return nil
+		return m.initAfterLogin()
 	}
 
 	return errors.New("after sending switch auth resp, but receive switch auth req again")
+}
+
+// initAfterLogin 成功注册后，完成一些初始化，包括：时区等会话变量的设置
+func (m *mysqlConn) initAfterLogin() error {
+	return m.setTimeZone()
 }
 
 func (m *mysqlConn) SrvSupportCpbs(cpbs []int) bool {
@@ -256,12 +170,12 @@ func (m *mysqlConn) newHandshakeResp(hs *HandshakeV10) (*HandshakeResp41, error)
 	return &HandshakeResp41{
 		CapFlag:       m.capFlag,
 		MaxPacketSize: 0,
-		CharSet:       45,
+		CharSet:       m.dbCfg.charsetNum,
 		Pad:           Byte2Str(make([]byte, 23)),
-		UserName:      m.dbInfo.user,
+		UserName:      m.dbCfg.user,
 		AuthRespLen:   uint8(len(authResp)),
 		AuthResp:      Byte2Str(authResp),
-		DataBase:      m.dbInfo.dbName,
+		DataBase:      m.dbCfg.dbName,
 		PluginName:    hs.AuthPluginName,
 	}, nil
 }
@@ -289,9 +203,9 @@ func (m *mysqlConn) newAuthSwitchResp(req *AuthSwitchReq) (*AuthSwitchResp, erro
 func (m *mysqlConn) buildAuthResp(scramble []byte, authMethod string) ([]byte, error) {
 	switch authMethod {
 	case "caching_sha2_password":
-		return buildAuthRespWithCachingSha2Password(scramble, m.dbInfo.password), nil
+		return buildAuthRespWithCachingSha2Password(scramble, m.dbCfg.password), nil
 	case "mysql_native_password":
-		return buildAuthRespWithMysqlNativePassword(scramble[:20], m.dbInfo.password), nil
+		return buildAuthRespWithMysqlNativePassword(scramble[:20], m.dbCfg.password), nil
 	default:
 		return nil, fmt.Errorf("unknown authMethod: %s", authMethod)
 	}
@@ -441,7 +355,7 @@ func (m *mysqlConn) setIsolationLevel(level sql.IsolationLevel) error {
 	}
 
 	if _, support := SupportedIsolationLevelSet[level]; !support {
-		 return fmt.Errorf("unsupported isolationLevel %s", level.String())
+		return fmt.Errorf("unsupported isolationLevel %s", level.String())
 	}
 
 	return m.prw.execCmdQuery(fmt.Sprintf("SET TRANSACTION ISOLATION LEVEL %s", level.String()))
@@ -450,6 +364,34 @@ func (m *mysqlConn) setIsolationLevel(level sql.IsolationLevel) error {
 // IsValid sql 会调用 IsValid 来判断连接是否有效
 func (m *mysqlConn) IsValid() bool {
 	return !m.closed
+}
+
+func (m *mysqlConn) setTimeZone() error {
+	_, offset := time.Now().Zone()
+	// val 需要携带双引号
+	val := fmt.Sprintf("\"%+03d:00\"", offset/3600)
+
+	return m.setSessionVariable("time_zone", val)
+}
+
+func (m *mysqlConn) setSessionVariable(key, value string) error {
+	return m.setVariable(key, value, false)
+}
+
+func (m *mysqlConn) setGlobalVariable(key, value string) error {
+	return m.setVariable(key, value, true)
+}
+
+func (m *mysqlConn) setVariable(key, value string, isGlobal bool) error {
+	var query string
+	if isGlobal {
+		query = fmt.Sprintf("SET GLOBAL %s = %s", key, value)
+	} else {
+		query = fmt.Sprintf("SET %s = %s", key, value)
+	}
+
+	m.curSeqID = 0
+	return m.prw.execCmdQuery(query)
 }
 
 func (m *mysqlConn) handleReadError(err error) error {
@@ -471,3 +413,4 @@ func (m *mysqlConn) handleWriteError(err error) error {
 
 	return err
 }
+
