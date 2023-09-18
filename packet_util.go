@@ -245,6 +245,7 @@ func (prw *pktReadWriter) readNextRow(ret []driver.Value, cols []*ColumnDef41) e
 	nullBitMap := Bitmap(nullBitMapByte)
 
 	for idx := 0; idx < len(cols); idx++ {
+		// NULL 值 对应 nil
 		if nullBitMap.IsSet(idx + 2) {
 			ret[idx] = nil
 			continue
