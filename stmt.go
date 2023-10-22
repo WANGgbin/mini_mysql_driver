@@ -135,8 +135,9 @@ func convert(src interface{}) (interface{}, error) {
 	val := reflect.ValueOf(src)
 	switch val.Kind() {
 	case reflect.Ptr:
+		// 空指针对应 nil interface{} 即 mysql 中的 NULL
 		if val.IsNil() {
-			return nil, errors.New("must not be nil pointer")
+			return nil, nil
 		}
 		// 注意：这里一定要通过 Interface() 函数将 reflect.Value 转化为 interface{}
 		// 不能直接：var i interface{} = reflect.Value
@@ -152,13 +153,13 @@ func convert(src interface{}) (interface{}, error) {
 	case reflect.String:
 		ret = val.String()
 	case reflect.Slice:
-		elemVal := val.Elem()
-		switch elemVal.Kind() {
+		elemTyp := val.Type().Elem()
+		switch elemTyp.Kind() {
 		case reflect.Uint8:
 			// 注意：val.Bytes() 并没有分配新的空间，直接返回底层 []byte 的引用
 			ret = val.Bytes()
 		default:
-			return nil, fmt.Errorf("type of slice must be reflect.Uint8, but we got %s", elemVal.Kind().String())
+			return nil, fmt.Errorf("type of slice must be reflect.Uint8, but we got %s", elemTyp.Kind().String())
 		}
 	}
 	return ret, nil
